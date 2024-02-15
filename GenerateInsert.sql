@@ -1,6 +1,6 @@
 USE [master]
 GO
-/****** Object:  StoredProcedure [dbo].[sp_generate_inserts]    Script Date: 2/15/2024 12:21:39 PM ******/
+/****** Object:  StoredProcedure [dbo].[sp_generate_inserts]    Script Date: 2/15/2024 8:58:16 PM ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -17,14 +17,13 @@ ALTER PROC [dbo].[sp_generate_inserts]
 , @UseColumnAliasInSelect bit = 0
 , @GenerateOneColumnPerLine bit = 0
 , @TopExpression nvarchar(max) = NULL
-, @FunctionParameters nvarchar(max) = NULL
 , @SearchCondition nvarchar(max) = NULL
 , @OrderByExpression nvarchar(max) = NULL
 , @OmmitUnsupportedDataTypes bit = 1
 , @PopulateTimestampColumn bit = 0
 , @GenerateStatementTerminator bit = 1
-, @ShowWarnings bit = 0
-, @cols_to_exclude nvarchar(max) = NULL	
+, @ColumnsExclude nvarchar(max) = NULL
+, @ColumnsInclude nvarchar(max) = NULL
 )
 AS
 BEGIN
@@ -109,7 +108,8 @@ OUTER APPLY (
 WHERE o.type = N'U' -- U = USER_TABLE
 AND o.object_id = OBJECT_ID(@ObjectName) --OR o.name = @ObjectName) ???
 AND COLUMNPROPERTY(c.object_id,c.name,'IsComputed') != 1
-AND c.name not in (select value from STRING_SPLIT(@cols_to_exclude,','))
+AND c.name not in (select value from STRING_SPLIT(@ColumnsExclude,','))
+AND (c.name in (select value from STRING_SPLIT(@ColumnsInclude,',')) or @ColumnsInclude is null)
 
 ORDER BY pk.is_primary_key desc,  COLUMNPROPERTY(c.object_id,c.name,'ordinal')
 FOR READ ONLY;
@@ -195,13 +195,6 @@ BEGIN
   RETURN -1;
 END
 
-IF NULLIF(@OmittedColumnList,'') IS NOT NULL
-  AND @ShowWarnings = 1
-BEGIN
-  PRINT(N'--*************************');
-  PRINT(N'--WARNING: The following columns have been omitted because of unsupported datatypes: ' + @OmittedColumnList);
-  PRINT(N'--*************************');
-END
 
 
   SET @SelectList = 
@@ -211,100 +204,18 @@ END
     + @SelectList
     + CASE WHEN @UseSelectSyntax = 1 THEN N'' ELSE N'+' + @CrLf + N''')''' END
     + CASE WHEN @GenerateStatementTerminator = 1 THEN N'+'';''' ELSE N'' END
-
-
-  ;
-
-
-SET @SelectStatement = N'SELECT'
-  + CASE WHEN NULLIF(@TopExpression,N'') IS NOT NULL
-    THEN N' TOP ' + @TopExpression
-    ELSE N'' END
-  + @CrLf + @SelectList + @CrLf
-  + N'FROM ' + @ObjectName
-  + CASE WHEN NULLIF(@FunctionParameters,N'') IS NOT NULL
-    THEN @FunctionParameters
-    ELSE N'' END
-  + CASE WHEN NULLIF(@SearchCondition,N'') IS NOT NULL
-    THEN @CrLf + N'WHERE ' + @SearchCondition
-    ELSE N'' END
-  + CASE WHEN NULLIF(@OrderByExpression,N'') IS NOT NULL
-    THEN @CrLf + N'ORDER BY ' + @OrderByExpression
-    ELSE N'' END
-  + @CrLf + N';' + @CrLf + @CrLf
 ;
 
 
-INSERT INTO @TableData EXECUTE (@SelectStatement);
+SET @SelectStatement = N'SELECT'
+  + CASE WHEN NULLIF(@TopExpression,N'') IS NOT NULL THEN N' TOP ' + @TopExpression ELSE N'' END
+  + @CrLf + @SelectList + @CrLf
+  + N'FROM ' + @ObjectName
+  + CASE WHEN NULLIF(@SearchCondition,N'') IS NOT NULL THEN @CrLf + N'WHERE ' + @SearchCondition ELSE N'' END
+  + CASE WHEN NULLIF(@OrderByExpression,N'') IS NOT NULL THEN @CrLf + N'ORDER BY ' + @OrderByExpression ELSE N'' END
+  + @CrLf + N';'
+;
 
-INSERT INTO @Results SELECT TableRow FROM @TableData
-
-
-
-
-
-
-
-
-  DECLARE @LongRows bigint;
-  SET @LongRows = (SELECT COUNT(*) FROM @Results WHERE LEN(TableRow) > 4000);
-
-  IF @LongRows > 0
-    AND @ShowWarnings = 1
-  BEGIN
-    PRINT(N'--*************************');
-    IF @LongRows = 1
-      PRINT(N'--WARNING: ' + CONVERT(nvarchar(max), @LongRows) + N' Row is very long and will be chopped at every 4000 character.')
-    ELSE
-      PRINT(N'--WARNING: ' + CONVERT(nvarchar(max), @LongRows) + N' Rows are very long and will be chopped at every 4000 character.');
-    PRINT(N'-- If this is an issue then the workaround is to use @PrintGeneratedCode = 0 and output "Result to Grid" in SSMS.');
-    PRINT(N'--*************************');
-  END
-
-  DECLARE ResultsCursor CURSOR LOCAL FAST_FORWARD FOR
-  SELECT TableRow
-  FROM @Results
-  FOR READ ONLY
-  ;
-  OPEN ResultsCursor;
-  FETCH NEXT FROM ResultsCursor INTO @TableRow;
-
-  WHILE @@FETCH_STATUS = 0
-  BEGIN
-    -- The following code is a workaround because the PRINT(@TableRow) has limit of 4,000 Unicode characters,
-    --   and longer strings are truncated.
-    -- It still has a con, the lines are chopped at every 4000 character, however at least everything is printed out.
-    -- http://stackoverflow.com/questions/7850477/how-to-print-varcharmax-using-print-statement
-    -- The workaround would be to use @PrintGeneratedCode = 0 and output "Result to Grid" in SSMS.
-    DECLARE @CurrentEnd bigint; -- track the length of the next sub-string
-    DECLARE @Offset tinyint; -- tracks the amount of offset needed
-    SET @TableRow = REPLACE(REPLACE(@TableRow, CHAR(13) + CHAR(10), CHAR(10)), CHAR(13), CHAR(10));
-
-    WHILE LEN(@TableRow) > 1
-    BEGIN
-      IF CHARINDEX(CHAR(10), @TableRow) BETWEEN 1 AND 4000
-      BEGIN
-        SET @CurrentEnd = CHARINDEX(CHAR(10), @TableRow) - 1;
-        SET @Offset = 2;
-      END
-      ELSE
-      BEGIN
-        SET @CurrentEnd = 4000;
-        SET @Offset = 1;
-      END
-
-      PRINT(SUBSTRING(@TableRow, 1, @CurrentEnd));
-      SET @TableRow = SUBSTRING(@TableRow, @CurrentEnd + @Offset, LEN(@TableRow))   
-    END
-
-    FETCH NEXT FROM ResultsCursor INTO @TableRow;
-  END
-
-  CLOSE ResultsCursor;
-  DEALLOCATE ResultsCursor;
-
-
-
-
+ EXECUTE (@SelectStatement);
 END
 
